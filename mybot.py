@@ -31,6 +31,7 @@ import json
 import argparse
 import random
 import websockets
+from collections import deque
 
 
 # ============================================================================
@@ -257,28 +258,39 @@ class MyBot:
         elif msg_type == "waiting":
             self.log("Waiting for opponent...")
 
+    def count_reachable_cells(self, start_pos, dangerous_set):
+        """Standard BFS to count reachable cells from start_pos."""
+        queue = deque([start_pos])
+        visited = {start_pos}
+        count = 0
+
+        while queue:
+            x, y = queue.popleft()
+            count += 1
+            # Maximum reachable count for our board size context
+            if count > 200:
+                break
+
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < self.grid_width and 0 <= ny < self.grid_height:
+                    if (nx, ny) not in dangerous_set and (nx, ny) not in visited:
+                        visited.add((nx, ny))
+                        queue.append((nx, ny))
+        return count
+
     # ========================================================================
     #  YOUR AI STRATEGY - Modify calculate_move() to change how your bot plays
     # ========================================================================
 
     def calculate_move(self) -> str | None:
         """Decide which direction to move.
-
-        This is the main function to customize! It's called every game tick
-        with the current game state, and should return one of:
-            "up", "down", "left", "right"
-
-        The default strategy:
-            1. Find all safe moves (not into walls or snakes)
-            2. Prefer moves that lead toward the nearest food
-            3. Prefer moves that leave more escape routes open
-            4. Avoid edges when possible
-
-        Available data:
-            self.game_state     - Full game state (see README for format)
-            self.player_id      - Your player number (1 or 2)
-            self.grid_width     - Width of the game board
-            self.grid_height    - Height of the game board
+        
+        Refined Strategy:
+            1. Identify all dangerous tiles (including opponent head's potential moves).
+            2. Run BFS (flood fill) to measure reachable space for each safe move.
+            3. Consider self-tail as a potential safe move (tail-chasing).
+            4. Adjust scoring to prioritize survivability (total space) over food pursuit.
         """
         if not self.game_state:
             return None
@@ -289,8 +301,10 @@ class MyBot:
         if not my_snake or not my_snake.get("body"):
             return None
 
-        head = my_snake["body"][0]              # [x, y] position of our head
+        head = my_snake["body"][0]
         current_dir = my_snake.get("direction", "right")
+        my_body = my_snake["body"]
+        my_length = len(my_body)
 
         # Get food items from the game state
         foods = self.game_state.get("foods", [])
@@ -304,13 +318,25 @@ class MyBot:
                 nearest_dist = dist
                 nearest_food = food
 
-        # Build a set of all dangerous positions (occupied by snake bodies).
-        # We exclude tail segments because they'll move away on the next tick.
+        # Build a set of all dangerous positions
         dangerous = set()
-        for snake_data in snakes.values():
+        for s_id, snake_data in snakes.items():
             body = snake_data.get("body", [])
-            for segment in body[:-1]:           # Skip the tail (last segment)
+            if not body:
+                continue
+            
+            # General dangerous tiles: all segments except the tail
+            for segment in body[:-1]:
                 dangerous.add((segment[0], segment[1]))
+            
+            # Opponent-specific danger: their head's next moves
+            if str(s_id) != str(self.player_id):
+                opp_head = body[0]
+                opp_length = len(body)
+                # If we are smaller or equal, avoid meeting their head head-on
+                if opp_length >= my_length:
+                    for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                        dangerous.add((opp_head[0] + dx, opp_head[1] + dy))
 
         # Direction vectors
         directions = {
@@ -319,74 +345,81 @@ class MyBot:
             "left": (-1, 0),
             "right": (1, 0)
         }
-
-        # Can't reverse direction (e.g. can't go left if currently going right)
         opposites = {"up": "down", "down": "up", "left": "right", "right": "left"}
 
         def is_safe(x, y):
-            """Check if a position is safe to move into."""
             if x < 0 or x >= self.grid_width or y < 0 or y >= self.grid_height:
                 return False
             return (x, y) not in dangerous
 
-        def count_escape_routes(x, y):
-            """Count how many safe moves are available from a position (0-4)."""
-            count = 0
-            for dx, dy in directions.values():
-                if is_safe(x + dx, y + dy):
-                    count += 1
-            return count
-
-        # Find all safe (non-wall, non-snake, non-reversing) moves
-        safe_moves = []
+        # Find all physically possible moves (no reversing)
+        possible_moves = []
         for direction, (dx, dy) in directions.items():
             if direction == opposites.get(current_dir):
                 continue
-            new_x = head[0] + dx
-            new_y = head[1] + dy
+            new_x, new_y = head[0] + dx, head[1] + dy
             if is_safe(new_x, new_y):
-                safe_moves.append({"direction": direction, "x": new_x, "y": new_y})
+                # Calculate reachable area for this move
+                reachable = self.count_reachable_cells((new_x, new_y), dangerous)
+                # Tail-chasing special case: self-tail is safe to move toward if space is low
+                is_tail = (new_x, new_y) == (my_body[-1][0], my_body[-1][1])
+                possible_moves.append({
+                    "direction": direction,
+                    "x": new_x, "y": new_y,
+                    "reachable": reachable,
+                    "is_tail": is_tail
+                })
 
-        # If no safe moves exist, just pick any non-reversing move
-        if not safe_moves:
-            for direction in directions:
-                if direction != opposites.get(current_dir):
+        if not possible_moves:
+            # Desperation: try the tail even if it's "not safe" in the set
+            my_tail = my_body[-1]
+            for direction, (dx, dy) in directions.items():
+                if direction == opposites.get(current_dir):
+                    continue
+                if (head[0] + dx, head[1] + dy) == (my_tail[0], my_tail[1]):
                     return direction
             return current_dir
-
-        # ==================================================================
-        #  SCORING - This is where you decide how "good" each move is.
-        #  Higher score = better move. Adjust the weights to change behavior.
-        # ==================================================================
 
         best_dir = None
         best_score = float('-inf')
 
-        for move in safe_moves:
+        for move in possible_moves:
             score = 0
             new_x, new_y = move["x"], move["y"]
+            reachable = move["reachable"]
 
-            # --- Food bonus: big reward for landing directly on food ---
+            # --- Survival is priority: huge bonus for reachable space ---
+            # If reachable area is less than our length, we are in trouble
+            if reachable < my_length:
+                score -= 1000
+            score += reachable * 10
+
+            # --- Target food if it's safe to do so ---
+            is_on_food = False
             for food in foods:
                 if new_x == food["x"] and new_y == food["y"]:
-                    score += 1000
+                    # Is it safe to eat? (Don't eat if it traps us, but BFS handles this)
+                    score += 500
+                    is_on_food = True
                     break
 
-            # --- Distance to food: prefer moves that get closer ---
-            if nearest_food:
+            if nearest_food and not is_on_food:
                 food_dist = abs(new_x - nearest_food["x"]) + abs(new_y - nearest_food["y"])
-                score += (self.grid_width + self.grid_height - food_dist) * 10
+                # Only value food if we have enough space
+                if reachable > my_length:
+                    score += (self.grid_width + self.grid_height - food_dist) * 5
 
-            # --- Escape routes: prefer moves that don't trap us ---
-            escape_routes = count_escape_routes(new_x, new_y)
-            score += escape_routes * 50
+            # --- Tail chasing bonus: follow our own tail if space is tight ---
+            if move["is_tail"] or reachable < my_length * 1.5:
+                # Add extra weight to moves that lead toward our tail
+                dist_to_tail = abs(new_x - my_body[-1][0]) + abs(new_y - my_body[-1][1])
+                score += (self.grid_width + self.grid_height - dist_to_tail) * 2
 
-            # --- Edge avoidance: small bonus for staying away from walls ---
+            # --- Edge avoidance ---
             edge_dist = min(new_x, self.grid_width - 1 - new_x,
                            new_y, self.grid_height - 1 - new_y)
-            score += edge_dist * 5
+            score += edge_dist * 2
 
-            # --- Update best move ---
             if score > best_score:
                 best_score = score
                 best_dir = move["direction"]
