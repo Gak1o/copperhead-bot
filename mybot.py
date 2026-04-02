@@ -44,7 +44,7 @@ from collections import deque
 GAME_SERVER = "ws://localhost:8765/ws/"
 
 # Your bot's display name (shown to all players in the tournament)
-BOT_NAME = "MyBot"
+BOT_NAME = "Gak1o AI"
 
 # How your bot appears in logs
 BOT_VERSION = "1.0"
@@ -286,11 +286,10 @@ class MyBot:
     def calculate_move(self) -> str | None:
         """Decide which direction to move.
         
-        Refined Strategy:
-            1. Identify all dangerous tiles (including opponent head's potential moves).
-            2. Run BFS (flood fill) to measure reachable space for each safe move.
-            3. Consider self-tail as a potential safe move (tail-chasing).
-            4. Adjust scoring to prioritize survivability (total space) over food pursuit.
+        Strategic Enhancements:
+            1. Prioritize Grapes (grapes) over Apples (apple).
+            2. Ignore food that is about to expire (lifetime < distance).
+            3. Adopt a defensive posture (tail-chasing) when comfortably ahead in length.
         """
         if not self.game_state:
             return None
@@ -305,15 +304,32 @@ class MyBot:
         current_dir = my_snake.get("direction", "right")
         my_body = my_snake["body"]
         my_length = len(my_body)
+        
+        # Get opponent info
+        opp_id = 3 - self.player_id
+        opp_snake = snakes.get(str(opp_id))
+        opp_length = len(opp_snake.get("body", [])) if opp_snake else 0
 
-        # Get food items from the game state
+        # Get food items and filter by reachability (lifetime vs distance)
         foods = self.game_state.get("foods", [])
-
-        # Find the nearest food item
-        nearest_food = None
-        nearest_dist = float('inf')
+        reachable_foods = []
         for food in foods:
             dist = abs(head[0] - food["x"]) + abs(head[1] - food["y"])
+            lifetime = food.get("lifetime")
+            if lifetime is not None and lifetime < dist + 2:
+                continue
+            reachable_foods.append(food)
+
+        # Find the best target food (Grapes prioritized)
+        nearest_food = None
+        nearest_dist = float('inf')
+        for food in reachable_foods:
+            dist = abs(head[0] - food["x"]) + abs(head[1] - food["y"])
+            # Grapes are much better (increases us, shrinks them)
+            # Give them a virtual distance bonus for prioritization
+            if food.get("type") == "grapes":
+                dist -= 12
+            
             if dist < nearest_dist:
                 nearest_dist = dist
                 nearest_food = food
@@ -332,7 +348,6 @@ class MyBot:
             # Opponent-specific danger: their head's next moves
             if str(s_id) != str(self.player_id):
                 opp_head = body[0]
-                opp_length = len(body)
                 # If we are smaller or equal, avoid meeting their head head-on
                 if opp_length >= my_length:
                     for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
@@ -389,17 +404,19 @@ class MyBot:
             reachable = move["reachable"]
 
             # --- Survival is priority: huge bonus for reachable space ---
-            # If reachable area is less than our length, we are in trouble
             if reachable < my_length:
                 score -= 1000
             score += reachable * 10
 
             # --- Target food if it's safe to do so ---
             is_on_food = False
-            for food in foods:
+            for food in reachable_foods:
                 if new_x == food["x"] and new_y == food["y"]:
                     # Is it safe to eat? (Don't eat if it traps us, but BFS handles this)
-                    score += 500
+                    if food.get("type") == "grapes":
+                        score += 800  # Grapes are delicious
+                    else:
+                        score += 400
                     is_on_food = True
                     break
 
@@ -407,18 +424,26 @@ class MyBot:
                 food_dist = abs(new_x - nearest_food["x"]) + abs(new_y - nearest_food["y"])
                 # Only value food if we have enough space
                 if reachable > my_length:
-                    score += (self.grid_width + self.grid_height - food_dist) * 5
+                    # Scale food value based on type in nearest_food as well
+                    multiplier = 8 if nearest_food.get("type") == "grapes" else 4
+                    score += (self.grid_width + self.grid_height - food_dist) * multiplier
 
-            # --- Tail chasing bonus: follow our own tail if space is tight ---
+            # --- Strategic Defensiveness ---
+            # If we are comfortably longer than the opponent, prioritize survival over food
+            is_ahead = (my_length > opp_length + 2)
+            
+            # Tail chasing bonus
             if move["is_tail"] or reachable < my_length * 1.5:
-                # Add extra weight to moves that lead toward our tail
                 dist_to_tail = abs(new_x - my_body[-1][0]) + abs(new_y - my_body[-1][1])
-                score += (self.grid_width + self.grid_height - dist_to_tail) * 2
+                safety_weight = 4 if is_ahead else 2
+                score += (self.grid_width + self.grid_height - dist_to_tail) * safety_weight
 
             # --- Edge avoidance ---
             edge_dist = min(new_x, self.grid_width - 1 - new_x,
                            new_y, self.grid_height - 1 - new_y)
-            score += edge_dist * 2
+            # Stay centered more if we are ahead (wait out the opponent)
+            edge_weight = 4 if is_ahead else 2
+            score += edge_dist * edge_weight
 
             if score > best_score:
                 best_score = score
